@@ -40,7 +40,9 @@ class Node:
         self.applied = 0
         self.lock = threading.RLock()
         self.client_lock = threading.Lock()
-        self.peer_locks = {peer: threading.Lock() for peer in peers}
+        # A single worker per peer coalesces heartbeat and client triggers.
+        # A trigger during an in-flight RPC remains set for the next round.
+        self.replication_events = {peer: threading.Event() for peer in peers}
         self.condition = threading.Condition(self.lock)
         self.role, self.leader_id = "follower", None
         self.next_index, self.match_index = {}, {}
@@ -105,8 +107,16 @@ class Node:
             self.role, self.leader_id = "follower", request["leader"]
             self._reset_deadline()
             prev = request["prev_index"]
-            if prev >= len(self.log) or self.log[prev]["term"] != request["prev_term"]:
-                return {"term": self.term, "success": False, "match": 0}
+            if prev >= len(self.log):
+                return {"term": self.term, "success": False, "match": 0,
+                        "conflict_index": len(self.log)}
+            if self.log[prev]["term"] != request["prev_term"]:
+                conflict_term = self.log[prev]["term"]
+                first = prev
+                while first > 0 and self.log[first - 1]["term"] == conflict_term:
+                    first -= 1
+                return {"term": self.term, "success": False, "match": 0,
+                        "conflict_index": first}
             changed = False
             for offset, entry in enumerate(request["entries"]):
                 index = prev + offset + 1
@@ -141,9 +151,25 @@ class Node:
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
+        for peer in self.peers:
+            threading.Thread(target=self._replication_worker, args=(peer,), daemon=True).start()
 
     def stop(self):
         self.stopped.set()
+        for event in self.replication_events.values():
+            event.set()
+
+    def _wake_replicators(self):
+        for event in self.replication_events.values():
+            event.set()
+
+    def _replication_worker(self, peer):
+        event = self.replication_events[peer]
+        while not self.stopped.is_set():
+            event.wait()
+            event.clear()
+            if not self.stopped.is_set():
+                self._replicate(peer)
 
     def _loop(self):
         next_heartbeat = 0.0
@@ -153,8 +179,7 @@ class Node:
                 due = time.monotonic() >= self.deadline
             if role == "leader":
                 if time.monotonic() >= next_heartbeat:
-                    for peer in self.peers:
-                        threading.Thread(target=self._replicate, args=(peer,), daemon=True).start()
+                    self._wake_replicators()
                     next_heartbeat = time.monotonic() + self.heartbeat
             elif due:
                 self._start_election()
@@ -166,38 +191,38 @@ class Node:
             self.role, self.leader_id = "candidate", None
             self.term += 1
             self.voted_for = self.id
+            self.votes_received = {self.id}
             self._persist()
             self._reset_deadline()
             term = self.term
             request = {"term": term, "candidate": self.id,
                        "last_index": len(self.log) - 1, "last_term": self.log[-1]["term"]}
-        votes = 1
         for peer in self.peers:
-            try:
-                response = self._rpc(peer, "/raft/vote", request)
-            except (OSError, ValueError, urllib.error.URLError):
-                continue
-            with self.lock:
-                if response["term"] > self.term:
-                    self._step_down(response["term"])
-                if self.role != "candidate" or self.term != term:
-                    return
-                votes += bool(response["granted"])
-                if votes >= 2:
-                    self.role, self.leader_id = "leader", self.id
-                    self.next_index = {p: len(self.log) for p in self.peers}
-                    self.match_index = {p: 0 for p in self.peers}
-                    self.condition.notify_all()
-                    break
-        if votes >= 2:
-            for peer in self.peers:
-                threading.Thread(target=self._replicate, args=(peer,), daemon=True).start()
+            threading.Thread(target=self._request_vote_from,
+                             args=(peer, term, request), daemon=True).start()
+
+    def _request_vote_from(self, peer, term, request):
+        try:
+            response = self._rpc(peer, "/raft/vote", request)
+        except (OSError, ValueError, urllib.error.URLError):
+            return
+        with self.lock:
+            if response["term"] > self.term:
+                self._step_down(response["term"])
+            if self.role != "candidate" or self.term != term:
+                return
+            if response["granted"]:
+                self.votes_received.add(peer)
+            if len(self.votes_received) >= 2:
+                self.role, self.leader_id = "leader", self.id
+                self.next_index = {p: len(self.log) for p in self.peers}
+                self.match_index = {p: 0 for p in self.peers}
+                self.condition.notify_all()
+                self._wake_replicators()
 
     def _replicate(self, peer):
-        # One in-flight AppendEntries per peer prevents stale RPC reordering.
-        if not self.peer_locks[peer].acquire(blocking=False):
-            return
-        try:
+        # Called only by this peer's worker: at most one RPC is in flight.
+        while not self.stopped.is_set():
             with self.lock:
                 if self.role != "leader":
                     return
@@ -220,10 +245,21 @@ class Node:
                     self.match_index[peer] = max(self.match_index[peer], response["match"])
                     self.next_index[peer] = self.match_index[peer] + 1
                     self._advance_commit()
+                    if self.next_index[peer] <= len(self.log) - 1:
+                        continue
                 else:
-                    self.next_index[peer] = max(1, self.next_index[peer] - 1)
-        finally:
-            self.peer_locks[peer].release()
+                    # A short follower or a conflicting term gives the first
+                    # index worth retrying, avoiding one heartbeat per entry.
+                    hint = response.get("conflict_index", index - 1)
+                    self.next_index[peer] = max(1, min(index - 1, hint))
+                    if self.next_index[peer] == index:
+                        return
+                    continue
+            event = self.replication_events[peer]
+            if event.is_set():
+                event.clear()
+                continue
+            return
 
     def _advance_commit(self):
         for index in range(len(self.log) - 1, self.commit, -1):
@@ -237,8 +273,14 @@ class Node:
 
     def propose(self, op, key, value=None, timeout=3.0):
         # Serializing clients makes the read entry's position a clear read barrier.
-        with self.client_lock:
+        limit = time.monotonic() + timeout
+        remaining = limit - time.monotonic()
+        if remaining <= 0 or not self.client_lock.acquire(timeout=remaining):
+            raise Unavailable("client deadline expired while waiting for proposal slot")
+        try:
             with self.condition:
+                if time.monotonic() >= limit:
+                    raise Unavailable("client deadline expired before proposal")
                 if self.role != "leader":
                     raise NotLeader(self.leader_id)
                 term = self.term
@@ -248,9 +290,7 @@ class Node:
                 self.log.append(entry)
                 self._persist()
                 index = len(self.log) - 1
-            for peer in self.peers:
-                threading.Thread(target=self._replicate, args=(peer,), daemon=True).start()
-            limit = time.monotonic() + timeout
+            self._wake_replicators()
             with self.condition:
                 while self.commit < index and self.role == "leader" and self.term == term:
                     remaining = limit - time.monotonic()
@@ -258,9 +298,12 @@ class Node:
                         raise Unavailable("no majority acknowledgement; outcome may be unknown")
                     self.condition.wait(remaining)
                 if (self.commit < index or self.role != "leader" or
-                        self.term != term or self.log[index] != entry):
+                        self.term != term or index >= len(self.log) or
+                        self.log[index] != entry):
                     raise Unavailable("leadership changed; outcome may be unknown")
                 return self.kv.get(key) if op == "get" else None
+        finally:
+            self.client_lock.release()
 
     def status(self):
         with self.lock:

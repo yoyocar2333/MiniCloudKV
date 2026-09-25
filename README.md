@@ -58,13 +58,13 @@ Use `"enabled":false` on both ends to heal it. The test suite also isolates a le
 | Reads | GET adds a nonmutating log entry, commits it on a majority, then reads the local state machine |
 | Recovery | Checksummed append-only WAL, periodic atomic fsynced snapshots, replay of committed entries |
 | Storage comparison | Full-state rewrite baseline (`--storage snapshot`) versus WAL (`--storage wal`, default), same sequential workload |
-| Verification | Tests for partition, failover/restart, stale reads, conflict repair, concurrent small-history linearizability |
+| Verification | 16 tests for partition, failover/restart, stale reads, conflict repair, concurrent small-history linearizability, queue deadlines, concurrent votes, fast catch-up, and checkpoint recovery |
 | Measurement | Baseline latency/throughput utility and real process crash-to-read timing |
 
 ## Scope and limitations
 
 - Fixed cluster of three nodes and localhost only. No membership changes, TLS, authentication, incremental state-machine snapshots, log compaction, or protection against physical disk loss.
-- The WAL fsyncs every transition and periodically checkpoints after 4,096 frames; no group commit or background compaction is claimed. A complete corrupt WAL frame stops startup; an incomplete trailing frame is discarded. The comparison baseline rewrites the complete state on each transition.
+- The WAL fsyncs every transition, including a separate commit-index update, and periodically checkpoints after 4,096 frames; no group commit or background compaction is claimed. A complete corrupt WAL frame stops startup; an incomplete trailing frame is discarded. Checkpointed WAL frames left by a crash are removed on recovery. The comparison baseline rewrites the complete state on each transition. Checkpoints retain the entire log; this system does not implement Raft InstallSnapshot or log compaction, and GET entries also grow the log.
 - The exact history checker handles up to 16 completed, successful operations per initially empty key. It is an experiment aid, not a formal proof or a complete Jepsen-like harness.
 - `GET` requires a new majority-committed log entry; reads stop during loss of quorum. This avoids serving stale data but increases disk and network traffic.
 - Fault injection blocks outgoing RPC per node. Use the debug route only on the local trusted host.

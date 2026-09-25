@@ -36,6 +36,31 @@ class StorageTest(unittest.TestCase):
             self.assertEqual(recovered.state, state)
             self.assertEqual(recovered.sequence, 2)
 
+    def test_recovery_removes_checkpointed_frames(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            wal = storage.WALStore(directory, snapshot_interval=2)
+            base = {"term": 1, "voted_for": "n1", "commit": 0,
+                    "log": [{"term": 0, "op": "noop"}]}
+            wal.persist(base)
+            old_bytes = (directory / "wal.bin").read_bytes()
+            committed = {**base, "commit": 1, "log": base["log"] + [
+                {"term": 1, "op": "put", "key": "a", "value": "1"}]}
+            wal.persist(committed)
+            # Crash after checkpoint rename and before WAL truncation.
+            (directory / "wal.bin").write_bytes(old_bytes)
+            recovered = storage.WALStore(directory, snapshot_interval=2)
+            self.assertEqual(recovered.state, committed)
+            self.assertEqual((directory / "wal.bin").stat().st_size, 0)
+            newer = {**committed, "commit": 2, "log": committed["log"] + [
+                {"term": 1, "op": "put", "key": "b", "value": "2"}]}
+            recovered.persist(newer)
+            new_bytes = (directory / "wal.bin").read_bytes()
+            (directory / "wal.bin").write_bytes(old_bytes + new_bytes)
+            again = storage.WALStore(directory, snapshot_interval=2)
+            self.assertEqual(again.state, newer)
+            self.assertEqual((directory / "wal.bin").read_bytes(), new_bytes)
+
     def test_replay_only_committed_entries(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "raft.json"

@@ -1,7 +1,7 @@
-"""Crash-safe replacement of the small Raft state file.
+"""Durable Raft state: full-state rewrite baseline and append-only WAL.
 
-A single state image keeps the term, vote, log, and commit index together. This
-is deliberately O(log size) per update; see docs/architecture.md.
+Both store the term, vote, log, and commit index. WAL checkpoints keep the
+whole log and are not state-machine snapshots; see docs/architecture.md.
 """
 import json
 import os
@@ -54,8 +54,10 @@ class WALStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         checkpoint = load(self.snapshot)
         self.sequence = checkpoint.get("sequence", 0)
+        checkpoint_sequence = self.sequence
         state = {key: checkpoint[key] for key in ("term", "voted_for", "log", "commit")}
         count = 0
+        skipped_prefix = 0
         if self.wal.exists():
             with self.wal.open("r+b") as handle:
                 valid = 0
@@ -74,7 +76,11 @@ class WALStore:
                     if zlib.crc32(payload) != checksum:
                         raise ValueError("corrupt complete WAL frame")
                     delta = json.loads(payload)
-                    if delta["sequence"] > self.sequence:
+                    if delta["sequence"] <= checkpoint_sequence:
+                        if count:
+                            raise ValueError("old WAL frame after new frames")
+                        skipped_prefix = handle.tell()
+                    else:
                         if delta["sequence"] != self.sequence + 1:
                             raise ValueError("WAL sequence gap")
                         state = self._apply_delta(state, delta)
@@ -85,10 +91,37 @@ class WALStore:
                     handle.truncate(valid)
                     handle.flush()
                     os.fsync(handle.fileno())
+            if skipped_prefix:
+                self._remove_checkpointed_prefix(skipped_prefix, valid)
         if not 0 <= state["commit"] < len(state["log"]):
             raise ValueError("invalid WAL commit index")
         self.state = {**state, "log": list(state["log"])}
         self.since_snapshot = count
+
+    def _remove_checkpointed_prefix(self, skipped, valid):
+        if skipped == valid:
+            with self.wal.open("wb") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+            return
+        temporary = self.wal.with_name(self.wal.name + ".tmp")
+        with self.wal.open("rb") as source, temporary.open("wb") as target:
+            source.seek(skipped)
+            remaining = valid - skipped
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError("WAL shortened during recovery")
+                target.write(chunk)
+                remaining -= len(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, self.wal)
+        directory = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     @staticmethod
     def _apply_delta(state, delta):
@@ -99,9 +132,14 @@ class WALStore:
     def persist(self, state):
         old = self.state["log"]
         new = state["log"]
-        prefix = 0
-        while prefix < min(len(old), len(new)) and old[prefix] == new[prefix]:
-            prefix += 1
+        if len(new) >= len(old) and old[-1] is new[len(old) - 1]:
+            # Entries are immutable and list copies share their objects. An
+            # unchanged last old entry proves the append-only prefix remains.
+            prefix = len(old)
+        else:
+            prefix = 0
+            while prefix < min(len(old), len(new)) and old[prefix] == new[prefix]:
+                prefix += 1
         delta = {"sequence": self.sequence + 1, "term": state["term"],
                  "voted_for": state["voted_for"], "commit": state["commit"],
                  "prefix": prefix, "suffix": new[prefix:]}
