@@ -113,12 +113,13 @@ def main():
     parser.add_argument("--listen", required=True, help="127.0.0.1:port")
     parser.add_argument("--peer", action="append", required=True, help="id=http://127.0.0.1:port")
     parser.add_argument("--data-dir", required=True, type=Path)
+    parser.add_argument("--storage", choices=("wal", "snapshot"), default="wal")
     args = parser.parse_args()
     peers = dict(peer.split("=", 1) for peer in args.peer)
     host, port = args.listen.rsplit(":", 1)
     if host not in ("127.0.0.1", "localhost", "::1"):
         parser.error("bind to localhost only; the demo RPC/admin API has no authentication")
-    node = Node(args.id, peers, args.data_dir)
+    node = Node(args.id, peers, args.data_dir, storage_mode=args.storage)
     server = ThreadingHTTPServer((host, int(port)), handler_for(node))
     node.start()
     signal.signal(signal.SIGTERM,

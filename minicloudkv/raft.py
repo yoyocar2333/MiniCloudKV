@@ -23,12 +23,17 @@ class Unavailable(Exception):
 
 class Node:
     def __init__(self, node_id: str, peers: dict[str, str], data_dir: Path,
-                 election_range=(0.35, 0.65), heartbeat=0.08, rpc_timeout=0.18):
+                 election_range=(0.35, 0.65), heartbeat=0.08, rpc_timeout=0.18,
+                 storage_mode="wal"):
         if node_id in peers or len(peers) != 2:
             raise ValueError("exactly two other peers are required")
         self.id, self.peers = node_id, peers
+        self.storage_mode = storage_mode
         self.path = Path(data_dir) / "raft.json"
-        state = storage.load(self.path)
+        self.wal_store = storage.WALStore(Path(data_dir)) if storage_mode == "wal" else None
+        if storage_mode not in ("wal", "snapshot"):
+            raise ValueError("storage_mode must be wal or snapshot")
+        state = self.wal_store.state if self.wal_store else storage.load(self.path)
         self.term, self.voted_for = state["term"], state["voted_for"]
         self.log, self.commit = state["log"], state["commit"]
         self.kv = {}
@@ -47,8 +52,12 @@ class Node:
         self._apply()
 
     def _persist(self):
-        storage.save(self.path, {"term": self.term, "voted_for": self.voted_for,
-                                 "log": self.log, "commit": self.commit})
+        state = {"term": self.term, "voted_for": self.voted_for,
+                 "log": self.log, "commit": self.commit}
+        if self.wal_store:
+            self.wal_store.persist(state)
+        else:
+            storage.save(self.path, state)
 
     def _reset_deadline(self):
         self.deadline = time.monotonic() + random.uniform(*self.election_range)

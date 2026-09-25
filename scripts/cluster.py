@@ -11,6 +11,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-port", type=int, default=8901)
     parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--storage", choices=("wal", "snapshot"), default="wal")
     args = parser.parse_args()
     temporary = tempfile.TemporaryDirectory() if args.data_root is None else None
     root = args.data_root or Path(temporary.name)
@@ -24,7 +25,7 @@ def main():
             processes.append(subprocess.Popen([
                 sys.executable, "-m", "minicloudkv.cli", "--id", node_id,
                 "--listen", f"127.0.0.1:{args.base_port + index}",
-                "--data-dir", str(root / node_id), *peers]))
+                "--data-dir", str(root / node_id), "--storage", args.storage, *peers]))
         print(f"cluster data: {root}", flush=True)
         print("nodes: " + " ".join(f"http://127.0.0.1:{args.base_port + i}" for i in range(3)), flush=True)
         print("pids: " + " ".join(str(p.pid) for p in processes), flush=True)
