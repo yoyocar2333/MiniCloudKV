@@ -1,0 +1,11 @@
+[project]
+name = "minicloudkv"
+version = "0.1.0"
+description = "A small, testable Raft replicated key-value store"
+requires-python = ">=3.11"
+
+[project.scripts]
+minicloudkv = "minicloudkv.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["minicloudkv*"]
